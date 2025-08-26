@@ -1,11 +1,10 @@
-# CloudType 배포용 - 완전 호환 확인된 버전
 fastapi==0.104.1
 uvicorn[standard]==0.24.0
 openai==1.3.8
-langchain==0.1.0
-langchain-openai==0.0.5
-langchain-community==0.0.13
-langchain-core==0.1.15
+langchain==0.1.4
+langchain-openai==0.0.8
+langchain-community==0.0.20
+langchain-core==0.1.23
 chromadb==0.4.22
 pydantic==2.5.2
 python-dotenv==1.0.0

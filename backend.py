@@ -7,7 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
 
-# ✅ 호환 확인된 신규 스택
+# ✅ 안정 버전 호환 imports
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 from langchain_community.vectorstores import Chroma
 from langchain.chains import RetrievalQA
@@ -35,7 +35,7 @@ def sanitize_markdown(text: str) -> str:
 # .env 로드
 load_dotenv()
 
-# 로깅 설정 (CloudType 로그 최적화)
+# 로깅 설정
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
@@ -58,11 +58,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 환경변수 (CloudType 최적화)
+# 환경변수
 OPENAI_API_KEY = sanitize_api_key(os.getenv("OPENAI_API_KEY", ""))
 CHROMADB_PATH = os.getenv("CHROMADB_PATH", "./chroma_db_uiseong_100_20250820_090753").strip()
 CHROMA_COLLECTION = os.getenv("CHROMA_COLLECTION", "uiseong_policies").strip()
-HOST = os.getenv("HOST", "0.0.0.0")  # CloudType 기본값
+HOST = os.getenv("HOST", "0.0.0.0")
 PORT = int(os.getenv("PORT", "8000"))
 
 # 요청/응답 모델
@@ -90,8 +90,8 @@ qa_chain = None
 vectorstore = None
 api_available = False
 
-# 초기화 (에러 내성)
 def initialize_system():
+    """시스템 초기화 (에러 내성)"""
     global qa_chain, vectorstore, api_available
     
     try:
@@ -99,8 +99,8 @@ def initialize_system():
             logger.warning("⚠️ OPENAI_API_KEY가 설정되지 않음. API 기능 비활성화.")
             return False
             
-        # OpenAI 임베딩 (에러 내성)
-        embeddings = OpenAIEmbeddings(api_key=OPENAI_API_KEY)
+        # OpenAI 임베딩 - openai_api_key 파라미터 사용 (호환성)
+        embeddings = OpenAIEmbeddings(openai_api_key=OPENAI_API_KEY)
         
         # ChromaDB 로드
         vectorstore = Chroma(
@@ -117,10 +117,10 @@ def initialize_system():
             doc_count = 0
             logger.warning("📊 ChromaDB 문서 수 확인 실패")
         
-        # ChatOpenAI (gpt-4o-mini)
+        # ChatOpenAI - openai_api_key 파라미터 사용 (호환성)
         llm = ChatOpenAI(
             model="gpt-4o-mini",
-            api_key=OPENAI_API_KEY,
+            openai_api_key=OPENAI_API_KEY,
             temperature=0.3
         )
         
@@ -335,7 +335,6 @@ def root():
         }
     }
 
-# 콘솔 테스트 함수
 def test_query(query: str):
     """로컬 테스트용"""
     if not api_available or qa_chain is None:
@@ -362,7 +361,6 @@ if __name__ == "__main__":
     # 초기화
     if initialize_system():
         print("✅ 시스템 초기화 완료")
-        # 콘솔 테스트
         print("\n🧪 테스트:")
         print(test_query("청년 주거 지원"))
     else:
