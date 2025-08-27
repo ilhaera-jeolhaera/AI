@@ -7,9 +7,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
 
-# ✅ 안정 버전 호환 imports
-from langchain_openai import OpenAIEmbeddings, ChatOpenAI
-from langchain_community.vectorstores import Chroma
+from langchain.embeddings.openai import OpenAIEmbeddings
+from langchain.chat_models import ChatOpenAI
+from langchain.vectorstores import Chroma
 from langchain.chains import RetrievalQA
 from langchain.prompts import PromptTemplate
 
@@ -117,12 +117,7 @@ def initialize_system():
             doc_count = 0
             logger.warning("📊 ChromaDB 문서 수 확인 실패")
         
-        # ChatOpenAI - openai_api_key 파라미터 사용 (호환성)
-        llm = ChatOpenAI(
-            model="gpt-4o-mini",
-            openai_api_key=OPENAI_API_KEY,
-            temperature=0.3
-        )
+        llm = ChatOpenAI(model_name="gpt-3.5-turbo", openai_api_key=OPENAI_API_KEY, temperature=0.3)
         
         # 프롬프트 템플릿
         prompt_template = """당신은 친근하고 전문적인 의성군 정책 상담사입니다.

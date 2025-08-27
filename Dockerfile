@@ -12,17 +12,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
  && rm -rf /var/lib/apt/lists/*
 
-# requirements.txt (레포에 실제로 존재하는 파일명!)
+# 의존성 먼저 설치 (캐시 최적화)
 COPY requirements.txt /app/requirements.txt
-RUN python -V && pip -V \
- && pip install --upgrade pip setuptools wheel \
+RUN pip install --upgrade pip setuptools wheel \
  && pip install -r /app/requirements.txt
 
-# 앱 코드 복사 (파일명 일치!)
+# 앱 복사
 COPY backend.py /app/backend.py
 
-# (선택) ChromaDB 폴더를 이미지 안에 포함하고 싶을 때만:
-# 폴더명이 실제와 다르면 아래 경로 수정
+# (옵션) DB를 이미지에 포함하고 싶을 때만 사용
 # COPY chroma_db_uiseong_100_20250820_090753/ /app/chroma_db_uiseong_100_20250820_090753/
 
 CMD ["python", "backend.py"]
