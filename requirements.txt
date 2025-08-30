@@ -1,6 +1,6 @@
 fastapi==0.104.1
 uvicorn[standard]==0.24.0
-openai==1.14.3
+openai>=1.24.0,<2
 langchain==0.2.14
 langchain-openai==0.1.7
 langchain-community==0.2.12
@@ -8,4 +8,4 @@ chromadb==0.4.22
 pydantic>=2.6,<3
 python-dotenv==1.0.0
 tiktoken==0.5.2
-requests==2.31.0
+requests>=2.31.0,<3
