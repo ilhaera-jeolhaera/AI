@@ -38,7 +38,8 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 if not OPENAI_API_KEY:
     raise ValueError("OPENAI_API_KEY가 비어 있습니다. .env 또는 환경변수로 설정하세요.")
 
-CHROMADB_PATH = os.getenv("CHROMADB_PATH", "./chroma_db_uiseong_100_20250820_090753").strip()
+# 컨테이너 기준 경로로 기본값 변경 (/app로 시작)
+CHROMADB_PATH = os.getenv("CHROMADB_PATH", "/app/chroma_db_uiseong_100_20250820_090753").strip()
 CHROMA_COLLECTION = os.getenv("CHROMA_COLLECTION", "uiseong_policies").strip()
 
 class QueryRequest(BaseModel):
@@ -106,7 +107,7 @@ try:
         chain_type_kwargs={"prompt": prompt, "document_variable_name": "context"},
     )
 
-    logger.info("✅ 의성군 정책 챗봇 초기화 완료 (레거시 스택, Chroma 0.4.x)")
+    logger.info("✅ 초기화 완료 (레거시 스택 / Chroma 0.4.x)")
 except Exception as e:
     logger.error("❌ 초기화 오류: %s", e)
     qa_chain = None
@@ -184,20 +185,23 @@ async def simple_search(query: str, limit: int = 5):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+# ✅ 헬스체크: Cloudtype이 200 OK만 보면 '접속하기'를 활성화하므로 항상 200을 반환
 @app.get("/health")
+@app.get("/healthz")
 def health_check():
+    ready = qa_chain is not None and vectorstore is not None
     try:
         count = len(vectorstore.get()["ids"]) if vectorstore else 0
-        return {
-            "status": "healthy",
-            "model": "gpt-3.5-turbo",
-            "chromadb_path": CHROMADB_PATH,
-            "collection": CHROMA_COLLECTION,
-            "total_policies": count,
-            "api_available": qa_chain is not None
-        }
-    except Exception as e:
-        return {"status": "error", "error": str(e)}
+    except Exception:
+        count = 0
+    return {
+        "status": "ok",
+        "ready": bool(ready),
+        "model": "gpt-3.5-turbo",
+        "chromadb_path": CHROMADB_PATH,
+        "collection": CHROMA_COLLECTION,
+        "total_policies": count
+    }
 
 @app.get("/")
 def root():
@@ -210,9 +214,20 @@ def root():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(
-        app,
-        host=os.getenv("HOST", "0.0.0.0"),
-        port=int(os.getenv("PORT", "8000")),
-        reload=False
-    )
+
+    host = os.getenv("HOST") or "0.0.0.0"
+
+    # PORT가 "", "${PORT}", "abc" 여도 안전하게 8000으로 폴백
+    def get_int(name: str, default: int) -> int:
+        raw = os.getenv(name)
+        try:
+            return int(raw) if raw and str(raw).isdigit() else default
+        except Exception:
+            return default
+
+    port = get_int("PORT", 8000)
+
+    logger.info(f"🚀 Starting Uvicorn on {host}:{port}")
+    logger.info(f"📦 ChromaDB: {CHROMADB_PATH} (collection={CHROMA_COLLECTION})")
+    uvicorn.run(app, host=host, port=port, reload=False)
+
