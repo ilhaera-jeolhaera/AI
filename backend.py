@@ -2,10 +2,13 @@ import os
 import json
 import re
 import logging
+import importlib, sqlite3
+import chromadb as _c
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
+
 
 # 레거시 스택용 임포트
 from langchain.embeddings.openai import OpenAIEmbeddings
@@ -66,6 +69,20 @@ class ChatbotResponse(BaseModel):
 qa_chain = None
 vectorstore = None
 try:
+    # ✅ Chroma 버전/스키마 가드 (여기에 추가)
+    import sqlite3, chromadb as _c
+    logger.info(f"[diag] chromadb={_c.__version__}")
+    db = os.path.join(CHROMADB_PATH, "chroma.sqlite3")
+    if os.path.exists(db):
+        con = sqlite3.connect(db); cur = con.cursor()
+        cur.execute("PRAGMA table_info(collections)")
+        cols = [r[1] for r in cur.fetchall()]; con.close()
+        schema = "0.5.x" if "topic" in cols else "0.4.x"
+        logger.info(f"[diag] DB schema={schema}")
+        if schema == "0.4.x" and _c.__version__.startswith("0.5"):
+            raise RuntimeError("chromadb 0.5.x가 0.4.x DB를 열려고 합니다. 캐시/requirements를 확인하세요.")
+
+    # ✅ 이후에 embeddings / vectorstore 생성
     embeddings = OpenAIEmbeddings(openai_api_key=OPENAI_API_KEY)
     vectorstore = Chroma(
         persist_directory=CHROMADB_PATH,
