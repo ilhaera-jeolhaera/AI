@@ -7,7 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
 
-# 레거시 스택용 임포트 (Chroma 0.4.x + langchain 0.0.x 계열)
+# 레거시 스택용 임포트
 from langchain.embeddings.openai import OpenAIEmbeddings
 from langchain.chat_models import ChatOpenAI
 from langchain.vectorstores import Chroma
@@ -39,7 +39,6 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 if not OPENAI_API_KEY:
     raise ValueError("OPENAI_API_KEY가 비어 있습니다. .env 또는 환경변수로 설정하세요.")
 
-# 로컬용: 폴더 경로는 프로젝트 내 상대경로 그대로 사용
 CHROMADB_PATH = os.getenv("CHROMADB_PATH", "./chroma_db_uiseong_100_20250820_090753").strip()
 CHROMA_COLLECTION = os.getenv("CHROMA_COLLECTION", "uiseong_policies").strip()
 
@@ -109,7 +108,7 @@ try:
         chain_type_kwargs={"prompt": prompt, "document_variable_name": "context"},
     )
 
-    logger.info("✅ 의성군 정책 챗봇 초기화 완료 (로컬 / 레거시 스택, Chroma 0.4.x)")
+    logger.info("✅ 의성군 정책 챗봇 초기화 완료 (레거시 스택, Chroma 0.4.x)")
 except Exception as e:
     logger.error("❌ 초기화 오류: %s", e)
     qa_chain = None
@@ -170,7 +169,7 @@ async def process_query(request: QueryRequest):
         raw_source = ""
         if result.get("source_documents"):
             raw_source = result["source_documents"][0].page_content
-        parsed = parse_chatbot_response(result["result"], raw_source)
+        parsed = parse_chatbot_response(sanitize_markdown(result["result"]), sanitize_markdown(raw_source))
         return ChatbotResponse(**parsed)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -190,6 +189,7 @@ async def simple_search(query: str, limit: int = 5):
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/health")
+@app.get("/healthz")  # Cloudtype 호환용
 def health_check():
     try:
         count = len(vectorstore.get()["ids"]) if vectorstore else 0
@@ -212,10 +212,20 @@ def root():
         "endpoints": {"query": "POST /query", "search": "GET /search/{query}", "health": "GET /health"}
     }
 
-# -------------------- 실행부 (로컬 고정) --------------------
+# -------------------- 실행부 --------------------
 if __name__ == "__main__":
     import uvicorn
-    HOST = "127.0.0.1"   # 로컬에서만 접근
-    PORT = 8000          # 고정 포트
-    logger.info(f"🚀 Starting Uvicorn on {HOST}:{PORT} (LOCAL)")
-    uvicorn.run(app, host=HOST, port=PORT, reload=False)
+
+    port_env = os.getenv("PORT")
+    if port_env and str(port_env).strip():
+        host = "0.0.0.0"
+        try:
+            port = int(port_env)
+        except ValueError:
+            port = 8000
+    else:
+        host = "127.0.0.1"
+        port = 8000
+
+    logger.info(f"🚀 Starting Uvicorn on {host}:{port}")
+    uvicorn.run(app, host=host, port=port, reload=False)

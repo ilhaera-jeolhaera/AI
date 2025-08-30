@@ -1,9 +1,24 @@
 # check_chroma_db_version.py
 import os, sys, sqlite3, glob
+from dotenv import load_dotenv
 
-DEFAULT_DB_DIR = "chroma_db_uiseong_100_20250820_090753"  # ← 기본 폴더 지정
+# -----------------------------
+# 1. .env 파일 로드
+# -----------------------------
+load_dotenv()
 
-path = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_DB_DIR
+# .env에 정의된 CHROMADB_PATH 읽기
+env_path = os.getenv("CHROMADB_PATH")
+
+# 실행 인자가 있으면 우선 사용, 없으면 .env → 기본값 순서로 결정
+DEFAULT_DB_DIR = "chroma_db_uiseong_100_20250820_090753"
+path = sys.argv[1] if len(sys.argv) > 1 else (env_path or DEFAULT_DB_DIR)
+
+print(f"🔍 검사할 ChromaDB 경로: {path}")
+
+# -----------------------------
+# 2. DB 파일 검사
+# -----------------------------
 db = os.path.join(path, "chroma.sqlite3")
 
 if not os.path.exists(db):
@@ -15,6 +30,9 @@ if not os.path.exists(db):
         print("❌ chroma.sqlite3 not found → 지정한 경로가 ChromaDB가 아닙니다.")
     sys.exit(0)
 
+# -----------------------------
+# 3. 스키마 버전 확인
+# -----------------------------
 con = sqlite3.connect(db)
 cur = con.cursor()
 cur.execute("PRAGMA table_info(collections)")
