@@ -7,15 +7,15 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
 
-# ★ 레거시 스택용 임포트 (신규 패키지와 섞지 마세요)
+# 레거시 스택용 임포트
 from langchain.embeddings.openai import OpenAIEmbeddings
 from langchain.chat_models import ChatOpenAI
 from langchain.vectorstores import Chroma
 from langchain.chains import RetrievalQA
 from langchain.prompts import PromptTemplate
 
+# -------------------- 초기 설정 --------------------
 load_dotenv()
-
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("uiseong_chatbot")
 
@@ -34,14 +34,15 @@ app.add_middleware(
     allow_methods=["*"], allow_headers=["*"],
 )
 
+# -------------------- 환경 변수 --------------------
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 if not OPENAI_API_KEY:
     raise ValueError("OPENAI_API_KEY가 비어 있습니다. .env 또는 환경변수로 설정하세요.")
 
-# 컨테이너 기준 경로로 기본값 변경 (/app로 시작)
-CHROMADB_PATH = os.getenv("CHROMADB_PATH", "/app/chroma_db_uiseong_100_20250820_090753").strip()
+CHROMADB_PATH = os.getenv("CHROMADB_PATH", "./chroma_db_uiseong_100_20250820_090753").strip()
 CHROMA_COLLECTION = os.getenv("CHROMA_COLLECTION", "uiseong_policies").strip()
 
+# -------------------- 모델 --------------------
 class QueryRequest(BaseModel):
     query: str
 
@@ -61,7 +62,7 @@ class ChatbotResponse(BaseModel):
     contact: ContactInfo
     source_summary: str
 
-# ---------- 초기화 (레거시 스택) ----------
+# -------------------- Chroma + LLM 초기화 --------------------
 qa_chain = None
 vectorstore = None
 try:
@@ -107,11 +108,12 @@ try:
         chain_type_kwargs={"prompt": prompt, "document_variable_name": "context"},
     )
 
-    logger.info("✅ 초기화 완료 (레거시 스택 / Chroma 0.4.x)")
+    logger.info("✅ 의성군 정책 챗봇 초기화 완료 (레거시 스택, Chroma 0.4.x)")
 except Exception as e:
     logger.error("❌ 초기화 오류: %s", e)
     qa_chain = None
 
+# -------------------- 응답 파서 --------------------
 def parse_chatbot_response(answer: str, source_content: str = "") -> dict:
     answer = sanitize_markdown(answer)
     source_content = sanitize_markdown(source_content)
@@ -157,6 +159,7 @@ def parse_chatbot_response(answer: str, source_content: str = "") -> dict:
         "source_summary": (source_content[:200] + "...") if len(source_content) > 200 else source_content,
     }
 
+# -------------------- 엔드포인트 --------------------
 @app.post("/query", response_model=ChatbotResponse)
 async def process_query(request: QueryRequest):
     if qa_chain is None:
@@ -185,49 +188,44 @@ async def simple_search(query: str, limit: int = 5):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# ✅ 헬스체크: Cloudtype이 200 OK만 보면 '접속하기'를 활성화하므로 항상 200을 반환
 @app.get("/health")
-@app.get("/healthz")
+@app.get("/healthz")  # Cloudtype 호환용
 def health_check():
-    ready = qa_chain is not None and vectorstore is not None
     try:
         count = len(vectorstore.get()["ids"]) if vectorstore else 0
-    except Exception:
-        count = 0
-    return {
-        "status": "ok",
-        "ready": bool(ready),
-        "model": "gpt-3.5-turbo",
-        "chromadb_path": CHROMADB_PATH,
-        "collection": CHROMA_COLLECTION,
-        "total_policies": count
-    }
+        return {
+            "status": "healthy",
+            "model": "gpt-3.5-turbo",
+            "chromadb_path": CHROMADB_PATH,
+            "collection": CHROMA_COLLECTION,
+            "total_policies": count,
+            "api_available": qa_chain is not None
+        }
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
 
 @app.get("/")
 def root():
     return {
-        "message": "의성군 정책 챗봇 로컬 API",
+        "message": "의성군 정책 챗봇 API",
         "version": "1.0.0",
-        "model": "gpt-3.5-turbo",
-        "endpoints": {"query": "POST /query", "search": "GET /search/{query}", "health": "GET /health", "docs": "GET /docs"}
+        "endpoints": {"query": "POST /query", "search": "GET /search/{query}", "health": "GET /health"}
     }
 
+# -------------------- 실행부 --------------------
 if __name__ == "__main__":
     import uvicorn
 
-    host = os.getenv("HOST") or "0.0.0.0"
-
-    # PORT가 "", "${PORT}", "abc" 여도 안전하게 8000으로 폴백
-    def get_int(name: str, default: int) -> int:
-        raw = os.getenv(name)
+    port_env = os.getenv("PORT")
+    if port_env and str(port_env).strip():
+        host = "0.0.0.0"
         try:
-            return int(raw) if raw and str(raw).isdigit() else default
-        except Exception:
-            return default
-
-    port = get_int("PORT", 8000)
+            port = int(port_env)
+        except ValueError:
+            port = 8000
+    else:
+        host = "127.0.0.1"
+        port = 8000
 
     logger.info(f"🚀 Starting Uvicorn on {host}:{port}")
-    logger.info(f"📦 ChromaDB: {CHROMADB_PATH} (collection={CHROMA_COLLECTION})")
     uvicorn.run(app, host=host, port=port, reload=False)
-
