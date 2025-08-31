@@ -6,11 +6,18 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
 
-# 텔레메트리 비활성화 (ChromaDB 경고 최소화)
+# 텔레메트리 비활성화 (ChromaDB 경고 최소화) - 더 강력한 설정
 os.environ["ANONYMIZED_TELEMETRY"] = "false"
 os.environ["CHROMA_TELEMETRY_IMPLEMENTATION"] = "none"
+os.environ["TOKENIZERS_PARALLELISM"] = "false"  # 토크나이저 병렬 처리 비활성화
+
+# ChromaDB 추가 설정
+import warnings
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+warnings.filterwarnings("ignore", category=UserWarning)
 
 # 레거시 LangChain 임포트 (langchain_openai, langchain_community 사용 금지)
+# pymongo는 사용하지 않습니다 - ChromaDB만 사용
 from langchain.embeddings.openai import OpenAIEmbeddings
 from langchain.chat_models import ChatOpenAI
 from langchain.vectorstores import Chroma
@@ -85,24 +92,67 @@ def initialize_components():
             openai_api_key=openai_api_key
         )
         
-        # ChromaDB vectorstore 초기화 (0.4.x 스키마)
-        vectorstore = Chroma(
-            persist_directory=CHROMA_DB_PATH,
-            embedding_function=embeddings,
-            collection_name=COLLECTION_NAME
-        )
-        
-        logger.info(f"ChromaDB 로드 완료: {CHROMA_DB_PATH}")
+        # ChromaDB vectorstore 초기화 (0.4.x 스키마 호환성 강화)
+        try:
+            # 먼저 기본 방식으로 시도
+            vectorstore = Chroma(
+                persist_directory=CHROMA_DB_PATH,
+                embedding_function=embeddings,
+                collection_name=COLLECTION_NAME
+            )
+            
+            # 연결 테스트
+            test_count = vectorstore._collection.count()
+            logger.info(f"ChromaDB 로드 성공: {test_count}개 문서")
+            
+        except Exception as chroma_error:
+            logger.error(f"ChromaDB 로드 실패: {str(chroma_error)}")
+            
+            # 0.4.x 호환성을 위한 대안 시도
+            try:
+                logger.info("0.4.x 호환 모드로 재시도...")
+                
+                # ChromaDB 클라이언트 직접 생성
+                import chromadb
+                from chromadb.config import Settings
+                
+                # 0.4.x 호환 설정
+                chroma_client = chromadb.PersistentClient(
+                    path=CHROMA_DB_PATH,
+                    settings=Settings(
+                        anonymized_telemetry=False,
+                        allow_reset=True
+                    )
+                )
+                
+                # 컬렉션 가져오기
+                collection = chroma_client.get_collection(COLLECTION_NAME)
+                
+                # Langchain Chroma wrapper로 감싸기
+                vectorstore = Chroma(
+                    client=chroma_client,
+                    collection_name=COLLECTION_NAME,
+                    embedding_function=embeddings
+                )
+                
+                test_count = collection.count()
+                logger.info(f"ChromaDB 호환 모드 로드 성공: {test_count}개 문서")
+                
+            except Exception as fallback_error:
+                logger.error(f"ChromaDB 호환 모드도 실패: {str(fallback_error)}")
+                logger.warning("ChromaDB를 사용할 수 없습니다. 검색 기능이 비활성화됩니다.")
+                return
         
         # ChatOpenAI 모델 초기화 (레거시 방식)
-        llm = ChatOpenAI(
-            model_name="gpt-3.5-turbo",
-            openai_api_key=openai_api_key,
-            temperature=0.3
-        )
-        
-        # 프롬프트 템플릿 설정
-        prompt_template = """당신은 의성군 정책 전문가입니다. 제공된 문맥을 바탕으로 질문에 대해 정확하고 상세한 답변을 제공해주세요.
+        if openai_api_key:
+            llm = ChatOpenAI(
+                model_name="gpt-3.5-turbo",
+                openai_api_key=openai_api_key,
+                temperature=0.3
+            )
+            
+            # 프롬프트 템플릿 설정
+            prompt_template = """당신은 의성군 정책 전문가입니다. 제공된 문맥을 바탕으로 질문에 대해 정확하고 상세한 답변을 제공해주세요.
 
 문맥: {context}
 
@@ -110,19 +160,23 @@ def initialize_components():
 
 답변: 제공된 문맥을 바탕으로 답변드리겠습니다."""
 
-        prompt = PromptTemplate(
-            template=prompt_template,
-            input_variables=["context", "question"]
-        )
-        
-        # RetrievalQA 체인 초기화
-        qa_chain = RetrievalQA.from_chain_type(
-            llm=llm,
-            chain_type="stuff",
-            retriever=vectorstore.as_retriever(search_kwargs={"k": 3}),
-            return_source_documents=True,
-            chain_type_kwargs={"prompt": prompt}
-        )
+            prompt = PromptTemplate(
+                template=prompt_template,
+                input_variables=["context", "question"]
+            )
+            
+            # RetrievalQA 체인 초기화
+            qa_chain = RetrievalQA.from_chain_type(
+                llm=llm,
+                chain_type="stuff",
+                retriever=vectorstore.as_retriever(search_kwargs={"k": 3}),
+                return_source_documents=True,
+                chain_type_kwargs={"prompt": prompt}
+            )
+            
+            logger.info("QA 체인 초기화 완료")
+        else:
+            logger.warning("OpenAI API 키가 없어 QA 체인을 초기화할 수 없습니다.")
         
         logger.info("LangChain 컴포넌트 초기화 완료")
         
@@ -287,11 +341,11 @@ if __name__ == "__main__":
     print(f"📍 ChromaDB 폴더 존재: {os.path.exists(CHROMA_DB_PATH)}")
     print("=" * 60)
     
-    # 로컬 테스트용 - reload 기능을 위해 문자열로 전달
+    # 로컬 개발용 설정
     uvicorn.run(
-        "backend:app",  # 문자열로 앱 경로 지정
-        host="127.0.0.1",  # 로컬에서만 접근
+        "backend:app",
+        host="127.0.0.1",  # 로컬호스트로 명시적 설정
         port=8000,
-        reload=True,  # 개발 중 자동 리로드
+        reload=True,
         log_level="info"
     )
