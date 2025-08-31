@@ -1,181 +1,232 @@
-# backend.py
 import os
 import logging
 from typing import List, Dict, Any, Optional
-
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+import uvicorn
+from openai import OpenAI
+import chromadb
+from chromadb.config import Settings
 
-# ── 로깅 ──────────────────────────────────────────────────────────
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("uiseong_chatbot")
-
-# ── 프록시/텔레메트리 차단(로컬 깔끔 실행용) ─────────────────────
-for k in ("HTTP_PROXY","HTTPS_PROXY","ALL_PROXY","http_proxy","https_proxy","all_proxy","OPENAI_PROXY"):
+# 텔레메트리/프록시 비활성화
+for k in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy", "OPENAI_PROXY"):
     os.environ.pop(k, None)
 os.environ["ANONYMIZED_TELEMETRY"] = "false"
 os.environ["CHROMA_TELEMETRY_IMPLEMENTATION"] = "none"
 
-# ── 라이브러리 임포트 (LangChain + OpenAI + Chroma 0.5.x) ────────
-from openai import OpenAI
-from langchain_openai import OpenAIEmbeddings, ChatOpenAI
-from langchain_community.vectorstores import Chroma
-from langchain.chains import RetrievalQA
-from langchain.prompts import PromptTemplate
+# 로깅 설정
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-# ── OpenAI 키 (로컬에서만: .env 없이 환경변수나 OS keyring 쓰지 않고 코드에서 직접 읽게 하려면 아래를 채우세요) ──
-# 1) 일반적으로는 환경변수로 설정:  export OPENAI_API_KEY="sk-..."
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-if not OPENAI_API_KEY:
-    raise ValueError("❌ OPENAI_API_KEY 환경변수가 비어 있습니다. 로컬에서 실행 전 설정해주세요.")
-
-# ── ChromaDB 0.5.x 로컬 경로(하드코딩) ───────────────────────────
-# 새로 생성한 0.5.x DB 폴더 경로로 바꿔 쓰세요.
+# 고정 경로/컬렉션
 CHROMA_DB_PATH = "./chroma_db_uiseong_20250831_new"
 COLLECTION_NAME = "uiseong_policies"
 
-# ── FastAPI 앱 ───────────────────────────────────────────────────
-app = FastAPI(
-    title="의성군 정책 검색 API",
-    description="ChromaDB 0.5.x + LangChain(OpenAI 1.x) 기반 / 로컬(127.0.0.1) 전용",
-    version="2.0.0",
-    docs_url="/docs",
-    redoc_url="/redoc",
-)
+# FastAPI 앱 초기화
+app = FastAPI(title="RAG API", version="1.0.0")
+
+# CORS 설정
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], allow_credentials=True,
-    allow_methods=["*"], allow_headers=["*"],
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
-# ── 전역 상태 ────────────────────────────────────────────────────
-vectorstore: Optional[Chroma] = None
-qa_chain: Optional[RetrievalQA] = None
+# 전역 변수
+openai_client: Optional[OpenAI] = None
+chroma_client = None
+collection = None
 
-def initialize_components():
-    """OpenAI(1.x) client 주입 + Chroma 0.5.x 로드 + QA 체인 구성"""
-    global vectorstore, qa_chain
-    try:
-        # OpenAI 1.x 클라이언트 생성 (proxies 문제 회피)
-        oa_client = OpenAI(api_key=OPENAI_API_KEY)
-
-        # 임베딩/LLM에 client 직접 주입 (중요!)
-        embeddings = OpenAIEmbeddings(
-            client=oa_client,
-            model="text-embedding-3-small",
-        )
-        llm = ChatOpenAI(
-            client=oa_client,
-            model="gpt-3.5-turbo",
-            temperature=0.3,
-        )
-
-        # Chroma 0.5.x 로드 (폴더가 반드시 0.5.x로 생성된 DB여야 함)
-        if not os.path.exists(CHROMA_DB_PATH):
-            logger.warning(f"⚠️ ChromaDB 경로 없음: {CHROMA_DB_PATH}")
-        vectorstore = Chroma(
-            persist_directory=CHROMA_DB_PATH,
-            embedding_function=embeddings,
-            collection_name=COLLECTION_NAME,
-        )
-
-        # 프롬프트 & QA 체인
-        prompt_template = """당신은 의성군 정책 전문가입니다.
-아래 문맥을 바탕으로 질문에 대해 간결하고 정확한 답변을 작성하세요.
-
-문맥:
-{context}
-
-질문: {question}
-
-답변:"""
-        prompt = PromptTemplate(
-            input_variables=["context","question"],
-            template=prompt_template,
-        )
-
-        qa_chain = RetrievalQA.from_chain_type(
-            llm=llm,
-            chain_type="stuff",
-            retriever=vectorstore.as_retriever(search_kwargs={"k": 3}),
-            return_source_documents=True,
-            chain_type_kwargs={"prompt": prompt},
-        )
-        logger.info("✅ 초기화 성공: Chroma(0.5.x) + QA 체인 준비 완료")
-    except Exception as e:
-        logger.error(f"❌ 초기화 실패: {e}")
-        vectorstore = None
-        qa_chain = None
-
-@app.on_event("startup")
-async def on_startup():
-    initialize_components()
-
-# ── 스키마 ───────────────────────────────────────────────────────
 class QueryRequest(BaseModel):
     question: str
-    k: Optional[int] = 3
+    k: int = 3
+
+class SearchDocument(BaseModel):
+    content: str
+    metadata: Dict[str, Any]
+    distance: float
+
+class SearchResponse(BaseModel):
+    documents: List[SearchDocument]
+    total_count: int
 
 class QueryResponse(BaseModel):
     answer: str
     source_documents: List[Dict[str, Any]]
 
-class SearchResponse(BaseModel):
-    documents: List[Dict[str, Any]]
-    total_count: int
+@app.on_event("startup")
+async def startup_event():
+    global openai_client, chroma_client, collection
+    
+    # OpenAI 클라이언트 초기화
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        logger.error("OPENAI_API_KEY environment variable not set")
+        raise RuntimeError("OPENAI_API_KEY environment variable not set")
+    
+    openai_client = OpenAI(api_key=api_key)
+    logger.info("OpenAI client initialized")
+    
+    # ChromaDB 클라이언트 초기화
+    try:
+        chroma_client = chromadb.PersistentClient(
+            path=CHROMA_DB_PATH,
+            settings=Settings(anonymized_telemetry=False, allow_reset=False)
+        )
+        collection = chroma_client.get_collection(COLLECTION_NAME)
+        logger.info(f"ChromaDB collection '{COLLECTION_NAME}' loaded from '{CHROMA_DB_PATH}'")
+    except Exception as e:
+        logger.error(f"Failed to initialize ChromaDB: {e}")
+        raise RuntimeError(f"Failed to initialize ChromaDB: {e}")
 
-# ── 엔드포인트 ───────────────────────────────────────────────────
+def get_embedding(text: str) -> List[float]:
+    """OpenAI 임베딩 생성"""
+    try:
+        response = openai_client.embeddings.create(
+            model="text-embedding-3-small",
+            input=text
+        )
+        return response.data[0].embedding
+    except Exception as e:
+        logger.error(f"Failed to get embedding: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to get embedding: {e}")
+
 @app.get("/")
 async def root():
     return {
-        "service": "의성군 정책 검색 API (로컬용)",
-        "status": "running",
-        "db_path": CHROMA_DB_PATH,
-        "collection": COLLECTION_NAME,
-        "docs": "/docs",
+        "service": "RAG API",
+        "version": "1.0.0",
+        "chroma_path": CHROMA_DB_PATH,
+        "collection_name": COLLECTION_NAME
     }
 
 @app.get("/health")
 @app.get("/healthz")
-async def health():
-    info = {
-        "status": "healthy" if vectorstore else "error",
-        "db_exists": os.path.exists(CHROMA_DB_PATH),
-        "collection": COLLECTION_NAME,
-        "vectorstore_initialized": vectorstore is not None,
-        "qa_chain_initialized": qa_chain is not None,
-    }
-    if vectorstore is not None:
-        try:
-            info["document_count"] = vectorstore._collection.count()
-        except Exception as e:
-            info["vectorstore_error"] = str(e)
-    return info
+async def health_check():
+    try:
+        db_exists = os.path.exists(CHROMA_DB_PATH)
+        document_count = None
+        
+        if collection is not None:
+            try:
+                document_count = collection.count()
+            except Exception as e:
+                logger.warning(f"Could not get document count: {e}")
+        
+        return {
+            "status": "healthy",
+            "db_exists": db_exists,
+            "collection_name": COLLECTION_NAME,
+            "document_count": document_count,
+            "initialized": collection is not None
+        }
+    except Exception as e:
+        logger.error(f"Health check failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Health check failed: {e}")
 
 @app.get("/search/{query}", response_model=SearchResponse)
-async def search(query: str, k: int = 5):
-    if vectorstore is None:
-        raise HTTPException(status_code=500, detail="Vectorstore가 초기화되지 않았습니다")
-    docs = vectorstore.similarity_search(query, k=k)
-    out = [{"content": d.page_content, "metadata": getattr(d,"metadata",{})} for d in docs]
-    return SearchResponse(documents=out, total_count=len(out))
+async def search_documents(query: str, k: int = 5):
+    if collection is None:
+        raise HTTPException(status_code=500, detail="ChromaDB collection not initialized")
+    
+    try:
+        # 쿼리 임베딩 생성
+        query_embedding = get_embedding(query)
+        
+        # ChromaDB에서 유사 문서 검색
+        results = collection.query(
+            query_embeddings=[query_embedding],
+            n_results=k,
+            include=['metadatas', 'documents', 'distances']
+        )
+        
+        documents = []
+        if results['documents'] and results['documents'][0]:
+            for i, doc in enumerate(results['documents'][0]):
+                documents.append(SearchDocument(
+                    content=doc,
+                    metadata=results['metadatas'][0][i] if results['metadatas'] and results['metadatas'][0] else {},
+                    distance=results['distances'][0][i] if results['distances'] and results['distances'][0] else 0.0
+                ))
+        
+        return SearchResponse(
+            documents=documents,
+            total_count=len(documents)
+        )
+    
+    except Exception as e:
+        logger.error(f"Search failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Search failed: {e}")
 
 @app.post("/query", response_model=QueryResponse)
-async def query_docs(req: QueryRequest):
-    if qa_chain is None:
-        raise HTTPException(status_code=500, detail="QA 체인이 초기화되지 않았습니다")
-    result = qa_chain({"query": req.question})
-    answer = result.get("result", "답변을 생성할 수 없습니다.")
-    sources = [{"content": d.page_content, "metadata": getattr(d,"metadata",{})} for d in result.get("source_documents", [])]
-    return QueryResponse(answer=answer, source_documents=sources)
+async def query_rag(request: QueryRequest):
+    if collection is None:
+        raise HTTPException(status_code=500, detail="ChromaDB collection not initialized")
+    
+    try:
+        # 1. 쿼리 임베딩 생성
+        query_embedding = get_embedding(request.question)
+        
+        # 2. ChromaDB에서 상위 k개 문서 검색
+        results = collection.query(
+            query_embeddings=[query_embedding],
+            n_results=request.k,
+            include=['metadatas', 'documents', 'distances']
+        )
+        
+        # 3. 컨텍스트 구성
+        context_docs = []
+        if results['documents'] and results['documents'][0]:
+            for i, doc in enumerate(results['documents'][0]):
+                context_docs.append({
+                    "content": doc,
+                    "metadata": results['metadatas'][0][i] if results['metadatas'] and results['metadatas'][0] else {}
+                })
+        
+        if not context_docs:
+            return QueryResponse(
+                answer="죄송합니다. 관련 문서를 찾을 수 없습니다.",
+                source_documents=[]
+            )
+        
+        # 4. 컨텍스트 텍스트 생성
+        context_text = "\n\n".join([doc["content"] for doc in context_docs])
+        
+        # 5. OpenAI Chat Completions로 답변 생성
+        system_message = """당신은 의성군 정책에 대한 질문에 답변하는 AI 어시스턴트입니다. 
+주어진 문서들을 바탕으로 정확하고 도움이 되는 답변을 제공하세요.
+문서에 없는 내용은 추측하지 말고, 모르겠다고 답변하세요."""
+        
+        user_message = f"""다음 문서들을 참고하여 질문에 답변해주세요:
 
-# ── 로컬 전용 실행(127.0.0.1 고정) ──────────────────────────────
+문서들:
+{context_text}
+
+질문: {request.question}"""
+        
+        chat_response = openai_client.chat.completions.create(
+            model="gpt-3.5-turbo",
+            messages=[
+                {"role": "system", "content": system_message},
+                {"role": "user", "content": user_message}
+            ],
+            temperature=0.1,
+            max_tokens=1000
+        )
+        
+        answer = chat_response.choices[0].message.content
+        
+        return QueryResponse(
+            answer=answer,
+            source_documents=context_docs
+        )
+    
+    except Exception as e:
+        logger.error(f"RAG query failed: {e}")
+        raise HTTPException(status_code=500, detail=f"RAG query failed: {e}")
+
 if __name__ == "__main__":
-    import uvicorn
-    print("=" * 60)
-    print("🚀 의성군 정책 검색 API 서버(로컬) 시작")
-    print(f"📍 http://127.0.0.1:8000   📚 /docs")
-    print(f"📁 ChromaDB: {CHROMA_DB_PATH}  (exists={os.path.exists(CHROMA_DB_PATH)})")
-    print("=" * 60)
-    uvicorn.run("backend:app", host="127.0.0.1", port=8000, reload=True)
+    uvicorn.run("backend:app", host="127.0.0.1", port=8000, reload=False)
