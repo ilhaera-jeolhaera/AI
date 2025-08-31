@@ -1,267 +1,297 @@
+import os
+import logging
+from typing import List, Dict, Any, Optional
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from langchain_openai import OpenAIEmbeddings, ChatOpenAI
-from langchain_community.vectorstores import Chroma
-from langchain.memory import ConversationBufferMemory
+from dotenv import load_dotenv
+
+# 텔레메트리 비활성화 (ChromaDB 경고 최소화)
+os.environ["ANONYMIZED_TELEMETRY"] = "false"
+os.environ["CHROMA_TELEMETRY_IMPLEMENTATION"] = "none"
+
+# 레거시 LangChain 임포트 (langchain_openai, langchain_community 사용 금지)
+from langchain.embeddings.openai import OpenAIEmbeddings
+from langchain.chat_models import ChatOpenAI
+from langchain.vectorstores import Chroma
 from langchain.chains import RetrievalQA
 from langchain.prompts import PromptTemplate
-from dotenv import load_dotenv
-from fastapi.middleware.cors import CORSMiddleware
-import os
-import sys
-import re
-from datetime import datetime
-import uuid
-from typing import Optional
-import json
-import logging
-from pymongo.mongo_client import MongoClient
-from pymongo.server_api import ServerApi
+
+# 환경변수 로드
+load_dotenv()
 
 # 로깅 설정
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# FastAPI 앱 초기화
-app = FastAPI()
+# FastAPI 앱 생성
+app = FastAPI(
+    title="의성군 정책 검색 API",
+    description="LangChain + ChromaDB를 활용한 의성군 정책 문서 검색 및 질의응답 서비스",
+    version="1.0.0"
+)
 
+# CORS 설정 (모든 오리진 허용)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "*"],
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# 환경 변수 및 MongoDB 설정
-load_dotenv()
-openai_api_key = os.getenv("OPENAI_API_KEY")
-if not openai_api_key:
-    raise ValueError("OPENAI_API_KEY가 .env 파일에 설정되지 않았습니다.")
-mongodb_uri = os.getenv("MONGODB_URI")
-if not mongodb_uri:
-    raise ValueError("MONGODB_URI가 .env 파일에 설정되지 않았습니다.")
-logger.info(f"사용된 MONGODB_URI: {mongodb_uri}")
+# 상수 설정
+CHROMA_DB_PATH = "./chroma_db_uiseong_100_20250820_090753"  # 로컬 상대경로 직접 지정
+COLLECTION_NAME = "uiseong_policies"
 
-# MongoDB 클라이언트 초기화
-try:
-    client = MongoClient(mongodb_uri, server_api=ServerApi('1'))
-    client.admin.command('ping')
-    logger.info("MongoDB에 성공적으로 연결되었습니다.")
-except Exception as e:
-    logger.error(f"MongoDB 연결 오류: {e}")
-    sys.exit(1)
-
-db = client["us"]
-conversations_collection = db["us_policy"]
-
-# 요청 및 응답 모델
+# Pydantic 모델
 class QueryRequest(BaseModel):
-    query: str
+    question: str
+    k: Optional[int] = 3  # 검색할 문서 수
 
 class QueryResponse(BaseModel):
-    policy: dict
-    contact: dict
-    source_summary: str
+    answer: str
+    source_documents: List[Dict[str, Any]]
 
-class HistoryResponse(BaseModel):
-    conversations: list[dict]
+class SearchResponse(BaseModel):
+    documents: List[Dict[str, Any]]
+    total_count: int
 
-# OpenAI API 상태 점검
-try:
-    from openai import OpenAI
-    client_openai = OpenAI(api_key=openai_api_key)
-    client_openai.embeddings.create(model="text-embedding-ada-002", input="테스트")
-except Exception as e:
-    logger.error(f"OpenAI API 초기화 오류: {e}")
-    sys.exit(1)
+# 전역 변수
+vectorstore = None
+qa_chain = None
 
-# Chroma 벡터 저장소 로드
-persist_directory = "chroma_db_20250523_092057"
-try:
-    embeddings = OpenAIEmbeddings(openai_api_key=openai_api_key)
-    vectorstore = Chroma(persist_directory=persist_directory, embedding_function=embeddings)
-except Exception as e:
-    logger.error(f"Chroma 벡터 저장소 로드 오류: {e}")
-    sys.exit(1)
+def initialize_components():
+    """LangChain 컴포넌트 초기화"""
+    global vectorstore, qa_chain
+    
+    try:
+        # OpenAI API 키 확인
+        openai_api_key = os.getenv("OPENAI_API_KEY")
+        if not openai_api_key:
+            logger.warning("OPENAI_API_KEY가 환경변수에 설정되지 않았습니다.")
+            logger.info("OpenAI 관련 기능이 제한될 수 있습니다.")
+        
+        logger.info("LangChain 컴포넌트 초기화 시작...")
+        
+        # ChromaDB 경로 확인
+        if not os.path.exists(CHROMA_DB_PATH):
+            logger.warning(f"ChromaDB 경로가 존재하지 않습니다: {CHROMA_DB_PATH}")
+            logger.info("검색 기능이 제한될 수 있습니다.")
+            return
+        
+        # 임베딩 모델 초기화 (레거시 방식)
+        embeddings = OpenAIEmbeddings(
+            openai_api_key=openai_api_key
+        )
+        
+        # ChromaDB vectorstore 초기화 (0.4.x 스키마)
+        vectorstore = Chroma(
+            persist_directory=CHROMA_DB_PATH,
+            embedding_function=embeddings,
+            collection_name=COLLECTION_NAME
+        )
+        
+        logger.info(f"ChromaDB 로드 완료: {CHROMA_DB_PATH}")
+        
+        # ChatOpenAI 모델 초기화 (레거시 방식)
+        llm = ChatOpenAI(
+            model_name="gpt-3.5-turbo",
+            openai_api_key=openai_api_key,
+            temperature=0.3
+        )
+        
+        # 프롬프트 템플릿 설정
+        prompt_template = """당신은 의성군 정책 전문가입니다. 제공된 문맥을 바탕으로 질문에 대해 정확하고 상세한 답변을 제공해주세요.
 
-# 챗봇 설정
-memory = ConversationBufferMemory(memory_key="chat_history", return_messages=True)
-llm = ChatOpenAI(model="gpt-3.5-turbo", api_key=openai_api_key, temperature=0.7)
-prompt_template = """당신은 의성군 지원 정책 전문가입니다. 주어진 문맥을 바탕으로 자연스럽고 정확한 답변을 제공하세요.
-
-문맥:
-{context}
+문맥: {context}
 
 질문: {question}
-"""
-prompt = PromptTemplate(input_variables=["context", "question"], template=prompt_template)
 
-qa_chain = RetrievalQA.from_chain_type(
-    llm=llm,
-    chain_type="stuff",
-    retriever=vectorstore.as_retriever(search_kwargs={"k": 1}),
-    return_source_documents=True,
-    chain_type_kwargs={
-        "prompt": prompt,
-        "document_variable_name": "context"
-    }
-)
+답변: 제공된 문맥을 바탕으로 답변드리겠습니다."""
 
-# 대화 기록 저장
-def save_conversation(user_input: str, bot_response: str):
-    try:
-        logger.info(f"저장하려는 데이터: user_input={user_input}, bot_response={bot_response}")
-        timestamp = datetime.now().isoformat()
-        conversation = {
-            "timestamp": timestamp,
-            "user_input": user_input,
-            "bot_response": bot_response
-        }
-        result = conversations_collection.insert_one(conversation)
-        logger.info(f"대화 기록 저장됨: input={user_input}, _id={result.inserted_id}")
-    except Exception as e:
-        logger.error(f"MongoDB 저장 오류: {e}")
-        raise
-
-# 대화 기록 조회
-def get_conversation_history():
-    try:
-        history = list(conversations_collection.find().sort("timestamp", 1))
-        return [
-            {
-                "timestamp": doc["timestamp"],
-                "user_input": doc["user_input"],
-                "bot_response": json.loads(doc["bot_response"]) if doc["bot_response"] and doc["bot_response"].strip() else {}
-            }
-            for doc in history
-        ]
-    except Exception as e:
-        logger.error(f"MongoDB 조회 오류: {e}")
-        return []
-
-# 응답 가공 함수
-def parse_policy_response(answer: str, source_content: str = ""):
-    if source_content:
-        source_content = re.sub(r"질문\s*:.*?(?=\n답변:|\Z)", "", source_content, flags=re.DOTALL)
-        source_content = re.sub(r"답변\s*:", "", source_content, flags=re.MULTILINE).strip()
-    
-    policy = {
-        "name": "",
-        "target": "",
-        "benefits": [],
-        "application": {"method": "", "documents": []},
-        "notes": []
-    }
-
-    lines = answer.split("\n")
-    for line in lines:
-        line = line.strip()
-        if not line: continue
-        if "정책명:" in line:
-            policy["name"] = line.split(":", 1)[1].strip()
-        elif "대상:" in line:
-            policy["target"] = line.split(":", 1)[1].strip() + " (외국인 가능성 있음)"
-        elif "지원 내용:" in line or line.startswith("-"):
-            if "지원 내용:" not in line:
-                policy["benefits"].append(line.strip("- ").strip())
-        elif "신청 방법:" in line:
-            policy["application"]["method"] = line.split(":", 1)[1].strip()
-        elif "필요 서류:" in line:
-            policy["application"]["documents"] = [doc.strip() for doc in line.split(":", 1)[1].split(",")]
-        elif "참고 사항:" in line or line.startswith("-") and "지원 내용" not in line:
-            if "참고 사항:" not in line:
-                policy["notes"].append(line.strip("- ").strip())
-
-    policy["notes"].append("외국인 자격은 의성군청 확인 필요")
-
-    contact = {
-        "phone": "054-830-6114",
-        "website": "https://www.uisung.go.kr"
-    }
-
-    source_summary = source_content if source_content else "데이터 없음"
-    logger.info(f"가공 후 source_summary: {source_summary!r}")
-
-    return {
-        "policy": policy,
-        "contact": contact,
-        "source_summary": source_summary
-    }
-
-# /query 엔드포인트
-@app.post("/query", response_model=QueryResponse)
-async def process_query(request: QueryRequest):
-    try:
-        logger.info(f"처리 시작 - query: {request.query}")
-        logger.info("OpenAI API 호출 시작")
-        response = qa_chain.invoke({"query": request.query})
-        logger.info(f"OpenAI API 호출 완료 - response['result']: {response['result']}, source_documents 길이: {len(response.get('source_documents', []))}")
-        
-        source_content = response['source_documents'][0].page_content if response.get('source_documents') and len(response['source_documents']) > 0 else "정보 없음"
-        logger.info(f"원본 source_content: {source_content}")
-
-        policy_keywords = ["정책", "지원", "주거", "청년", "신혼부부", "의성", "주택", "금융", "신청", "자격"]
-        query_lower = request.query.lower()
-        is_policy_related = any(keyword in query_lower for keyword in policy_keywords)
-
-        if not is_policy_related:
-            default_response = {
-                "policy": {
-                    "name": "",
-                    "target": "",
-                    "benefits": [],
-                    "application": {"method": "", "documents": []},
-                    "notes": ["이 질문은 의성군 정책과 관련이 없는 것 같습니다. 예를 들어, '의성군 청년층 지원 정책'이나 '신혼부부 주거 지원 조건'에 대해 물어보세요!"]
-                },
-                "contact": {
-                    "phone": "054-830-6114",
-                    "website": "https://www.uisung.go.kr"
-                },
-                "source_summary": "정책 관련 질문을 기다립니다."
-            }
-            logger.info(f"정책 관련성 없음 - 반환: {json.dumps(default_response, ensure_ascii=False)}")
-            return QueryResponse(**default_response)
-
-        logger.info("응답 가공 시작")
-        parsed_response = parse_policy_response(
-            answer=response['result'],
-            source_content=source_content
+        prompt = PromptTemplate(
+            template=prompt_template,
+            input_variables=["context", "question"]
         )
-        logger.info(f"가공 완료 - parsed_response: {json.dumps(parsed_response, ensure_ascii=False)}")
         
-        logger.info("메모리 저장 시작")
-        memory.save_context({"input": request.query}, {"output": response["result"]})
-        logger.info("메모리 저장 완료")
+        # RetrievalQA 체인 초기화
+        qa_chain = RetrievalQA.from_chain_type(
+            llm=llm,
+            chain_type="stuff",
+            retriever=vectorstore.as_retriever(search_kwargs={"k": 3}),
+            return_source_documents=True,
+            chain_type_kwargs={"prompt": prompt}
+        )
         
-        logger.info("DB 저장 시작")
-        save_conversation(request.query, json.dumps(parsed_response))
-        logger.info("DB 저장 완료")
+        logger.info("LangChain 컴포넌트 초기화 완료")
         
-        logger.info(f"응답 반환 - response: {json.dumps(parsed_response, ensure_ascii=False)}")
-        return QueryResponse(**parsed_response)
     except Exception as e:
-        logger.error(f"/query 오류: {e}")
-        raise HTTPException(status_code=500, detail=f"오류: {str(e)}")
+        logger.error(f"컴포넌트 초기화 실패: {str(e)}")
+        logger.info("일부 기능이 제한될 수 있지만 서버는 계속 실행됩니다.")
 
-# /history 엔드포인트
-# 기존 문제 코드 삭제 후 다음으로 수정
-@app.get("/history", response_model=HistoryResponse)
-async def get_history():  # async def로 통일
+@app.on_event("startup")
+async def startup_event():
+    """앱 시작 시 초기화"""
     try:
-        history = get_conversation_history()
-        return {"conversations": history}  # 모델과 일치하도록 반환 
+        initialize_components()
+        logger.info("서비스가 성공적으로 시작되었습니다.")
     except Exception as e:
-        logger.error(f"/history 오류: {e}")
-        raise HTTPException(status_code=500, detail=f"오류: {str(e)}")
+        logger.error(f"서비스 시작 실패: {str(e)}")
+        # 서비스는 계속 실행하되, 에러 상태를 유지
 
-# health_check는 별도 엔드포인트로 분리 (필요시)
+@app.get("/")
+async def root():
+    """기본 정보 반환"""
+    return {
+        "service": "의성군 정책 검색 API",
+        "version": "1.0.0",
+        "status": "running",
+        "description": "FastAPI + LangChain + ChromaDB를 활용한 의성군 정책 문서 검색 및 질의응답 서비스",
+        "endpoints": {
+            "health": "/health 또는 /healthz",
+            "search": "/search/{query}",
+            "query": "/query (POST)"
+        }
+    }
+
+@app.get("/health")
+async def health_check():
+    """헬스체크 엔드포인트"""
+    try:
+        # 기본 상태 확인
+        status_info = {
+            "status": "healthy",
+            "message": "서비스가 정상 동작 중입니다",
+            "chroma_db_path": CHROMA_DB_PATH,
+            "chroma_db_exists": os.path.exists(CHROMA_DB_PATH),
+            "vectorstore_initialized": vectorstore is not None,
+            "qa_chain_initialized": qa_chain is not None
+        }
+        
+        # vectorstore 연결 확인
+        if vectorstore is not None:
+            try:
+                collection = vectorstore._collection
+                document_count = collection.count() if collection else 0
+                status_info["document_count"] = document_count
+            except Exception as e:
+                status_info["vectorstore_error"] = str(e)
+        
+        return status_info
+            
+    except Exception as e:
+        return {
+            "status": "error", 
+            "message": f"Health check failed: {str(e)}",
+            "chroma_db_path": CHROMA_DB_PATH,
+            "chroma_db_exists": os.path.exists(CHROMA_DB_PATH)
+        }
+
 @app.get("/healthz")
-def health_check():
-    return {"status": "ok"}
-    
+async def healthz():
+    """Cloudtype 헬스체크용 엔드포인트"""
+    return await health_check()
 
-# 서버 실행
+@app.get("/search/{query}", response_model=SearchResponse)
+async def search_documents(query: str, k: int = 5):
+    """문서 유사도 검색"""
+    try:
+        if vectorstore is None:
+            raise HTTPException(status_code=500, detail="Vectorstore가 초기화되지 않았습니다")
+        
+        # 유사도 검색 수행
+        docs = vectorstore.similarity_search(query, k=k)
+        
+        # 결과 포맷팅
+        formatted_docs = []
+        for doc in docs:
+            doc_dict = {
+                "content": doc.page_content,
+                "metadata": doc.metadata if hasattr(doc, 'metadata') else {}
+            }
+            formatted_docs.append(doc_dict)
+        
+        return SearchResponse(
+            documents=formatted_docs,
+            total_count=len(formatted_docs)
+        )
+        
+    except Exception as e:
+        logger.error(f"검색 오류: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"검색 중 오류가 발생했습니다: {str(e)}")
+
+@app.post("/query", response_model=QueryResponse)
+async def query_documents(request: QueryRequest):
+    """질의응답 수행"""
+    try:
+        if qa_chain is None:
+            raise HTTPException(status_code=500, detail="QA 체인이 초기화되지 않았습니다")
+        
+        # RetrievalQA 체인으로 답변 생성
+        result = qa_chain({
+            "query": request.question
+        })
+        
+        # 결과 파싱
+        answer = result.get("result", "답변을 생성할 수 없습니다.")
+        source_docs = result.get("source_documents", [])
+        
+        # 소스 문서 포맷팅
+        formatted_sources = []
+        for doc in source_docs:
+            source_dict = {
+                "content": doc.page_content,
+                "metadata": doc.metadata if hasattr(doc, 'metadata') else {}
+            }
+            formatted_sources.append(source_dict)
+        
+        return QueryResponse(
+            answer=answer,
+            source_documents=formatted_sources
+        )
+        
+    except Exception as e:
+        logger.error(f"질의응답 오류: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"질의응답 중 오류가 발생했습니다: {str(e)}")
+
+@app.get("/collections")
+async def get_collections():
+    """ChromaDB 컬렉션 정보 조회"""
+    try:
+        if vectorstore is None:
+            raise HTTPException(status_code=500, detail="Vectorstore가 초기화되지 않았습니다")
+        
+        # 컬렉션 정보 가져오기 (0.4.x 방식)
+        collection = vectorstore._collection
+        count = collection.count()
+        
+        return {
+            "collection_name": COLLECTION_NAME,
+            "document_count": count,
+            "persist_directory": CHROMA_DB_PATH
+        }
+        
+    except Exception as e:
+        logger.error(f"컬렉션 정보 조회 오류: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"컬렉션 정보 조회 중 오류가 발생했습니다: {str(e)}")
+
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="127.0.0.1", port=8000)
+    print("=" * 60)
+    print("🚀 의성군 정책 검색 API 서버 시작")
+    print("=" * 60)
+    print(f"📍 로컬 접속 URL: http://127.0.0.1:8000")
+    print(f"📍 API 문서: http://127.0.0.1:8000/docs")
+    print(f"📍 ChromaDB 경로: {CHROMA_DB_PATH}")
+    print(f"📍 ChromaDB 폴더 존재: {os.path.exists(CHROMA_DB_PATH)}")
+    print("=" * 60)
+    
+    # 로컬 테스트용 - reload 기능을 위해 문자열로 전달
+    uvicorn.run(
+        "backend:app",  # 문자열로 앱 경로 지정
+        host="127.0.0.1",  # 로컬에서만 접근
+        port=8000,
+        reload=True,  # 개발 중 자동 리로드
+        log_level="info"
+    )
