@@ -9,11 +9,14 @@ from openai import OpenAI
 import chromadb
 from chromadb.config import Settings
 
-# 텔레메트리/프록시 비활성화
-for k in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy", "OPENAI_PROXY"):
+# 텔레메트리/프록시 비활성화 (CloudType 환경 대응)
+for k in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy", "OPENAI_PROXY", "NO_PROXY", "no_proxy"):
     os.environ.pop(k, None)
 os.environ["ANONYMIZED_TELEMETRY"] = "false"
 os.environ["CHROMA_TELEMETRY_IMPLEMENTATION"] = "none"
+# CloudType 환경에서 프록시 관련 추가 제거
+os.environ.pop("REQUESTS_CA_BUNDLE", None)
+os.environ.pop("CURL_CA_BUNDLE", None)
 
 # 로깅 설정
 logging.basicConfig(level=logging.INFO)
@@ -61,14 +64,30 @@ class QueryResponse(BaseModel):
 async def startup_event():
     global openai_client, chroma_client, collection
     
-    # OpenAI 클라이언트 초기화
+    # OpenAI 클라이언트 초기화 (CloudType 환경 대응)
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
         logger.error("OPENAI_API_KEY environment variable not set")
         raise RuntimeError("OPENAI_API_KEY environment variable not set")
     
-    openai_client = OpenAI(api_key=api_key)
-    logger.info("OpenAI client initialized")
+    try:
+        # 프록시 관련 인자를 명시적으로 제거하여 초기화
+        openai_client = OpenAI(
+            api_key=api_key,
+            timeout=30.0,
+            max_retries=3
+        )
+        logger.info("OpenAI client initialized successfully")
+    except Exception as e:
+        logger.error(f"Failed to initialize OpenAI client: {e}")
+        # 더 단순한 방식으로 재시도
+        try:
+            import openai as openai_module
+            openai_client = openai_module.OpenAI(api_key=api_key)
+            logger.info("OpenAI client initialized with fallback method")
+        except Exception as e2:
+            logger.error(f"Fallback OpenAI initialization also failed: {e2}")
+            raise RuntimeError(f"Failed to initialize OpenAI client: {e}")
     
     # ChromaDB 클라이언트 초기화
     try:
