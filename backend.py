@@ -12,8 +12,13 @@ from langchain_community.vectorstores import Chroma
 from langchain.chains import RetrievalQA
 from langchain.prompts import PromptTemplate
 
+
 # -------------------- 환경 변수 로드 --------------------
 load_dotenv()
+
+for k in ("HTTP_PROXY","HTTPS_PROXY","ALL_PROXY","http_proxy","https_proxy","all_proxy","OPENAI_PROXY"):
+    os.environ.pop(k, None)
+    
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 if not OPENAI_API_KEY:
