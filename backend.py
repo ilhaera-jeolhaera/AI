@@ -48,7 +48,7 @@ app.add_middleware(
 )
 
 # 상수 설정
-CHROMA_DB_PATH = "./chroma_db_uiseong_100_20250820_090753"  # 로컬 상대경로 직접 지정
+CHROMA_DB_PATH = "./chroma_db_uiseong_100_20250831_new"  # 로컬 상대경로 직접 지정
 COLLECTION_NAME = "uiseong_policies"
 
 # Pydantic 모델

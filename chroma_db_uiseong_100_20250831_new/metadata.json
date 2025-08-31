@@ -1,0 +1,8 @@
+{
+  "creation_date": "2025-08-31T12:25:46.282218",
+  "chromadb_version": "0.4.22",
+  "collection_name": "uiseong_policies",
+  "document_count": 100,
+  "embedding_model": "text-embedding-ada-002",
+  "description": "의성군 정책 문서 벡터 데이터베이스"
+}
