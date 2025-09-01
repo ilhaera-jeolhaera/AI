@@ -4,3 +4,4 @@ pydantic
 openai
 chromadb
 python-multipart
+pandas

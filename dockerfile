@@ -13,7 +13,12 @@ RUN pip install --no-cache-dir -r cloudtype_requirements.txt
 
 # Copy application files
 COPY backend.py .
+COPY load_data.py .
+COPY attached_assets/ ./attached_assets/
+
+# Copy ChromaDB data with proper permissions
 COPY chroma_db_uiseong_20250831_new/ ./chroma_db_uiseong_20250831_new/
+RUN chmod -R 755 ./chroma_db_uiseong_20250831_new/
 
 # Set environment variables
 ENV PYTHONUNBUFFERED=1

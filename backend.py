@@ -1,5 +1,6 @@
 import os
 import asyncio
+import pandas as pd
 from typing import List, Dict, Any, Optional
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Query
@@ -26,7 +27,7 @@ async def lifespan(app: FastAPI):
     # Startup
     logger.info("Starting RAG server...")
     initialize_openai()
-    initialize_chromadb()
+    await initialize_chromadb()
     logger.info("RAG server startup completed")
     yield
     # Shutdown
@@ -81,8 +82,44 @@ def initialize_openai():
     openai_client = OpenAI(api_key=api_key)
     logger.info("OpenAI client initialized successfully")
 
+# Load initial data from CSV
+async def load_initial_data():
+    """Load data from CSV files into ChromaDB collection"""
+    try:
+        import glob
+        csv_files = glob.glob("./attached_assets/*.csv")
+        
+        if not csv_files:
+            logger.warning("No CSV files found in attached_assets directory")
+            return
+        
+        for csv_file in csv_files:
+            logger.info(f"Loading data from {csv_file}")
+            df = pd.read_csv(csv_file)
+            
+            # Process each row
+            for idx, row in df.iterrows():
+                # Create document text from all columns
+                doc_text = " ".join([f"{col}: {val}" for col, val in row.items() if pd.notna(val)])
+                
+                # Generate embedding
+                embedding = await generate_embedding(doc_text)
+                
+                # Add to collection
+                collection.add(
+                    documents=[doc_text],
+                    embeddings=[embedding],
+                    metadatas=[{"source": os.path.basename(csv_file), "row_id": idx}],
+                    ids=[f"{os.path.basename(csv_file)}_{idx}"]
+                )
+        
+        logger.info(f"Data loading completed. Collection now has {collection.count()} documents")
+        
+    except Exception as e:
+        logger.error(f"Failed to load initial data: {str(e)}")
+
 # Initialize ChromaDB client and collection
-def initialize_chromadb():
+async def initialize_chromadb():
     global chroma_client, collection
     
     try:
@@ -103,11 +140,19 @@ def initialize_chromadb():
         # Get or create collection
         try:
             collection = chroma_client.get_collection(name="uiseong_policies")
-            logger.info(f"ChromaDB collection 'uiseong_policies' loaded successfully")
+            # Check if collection has data
+            count = collection.count()
+            if count == 0:
+                logger.info("Collection exists but is empty, loading data...")
+                await load_initial_data()
+            else:
+                logger.info(f"ChromaDB collection 'uiseong_policies' loaded successfully with {count} documents")
         except NotFoundError:
             logger.info("Collection 'uiseong_policies' not found, creating new collection...")
             collection = chroma_client.create_collection(name="uiseong_policies")
             logger.info(f"ChromaDB collection 'uiseong_policies' created successfully")
+            # Load initial data
+            await load_initial_data()
         
     except Exception as e:
         logger.error(f"Failed to initialize ChromaDB: {str(e)}")
