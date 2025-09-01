@@ -1,108 +1,123 @@
 import os
-import logging
+import asyncio
 from typing import List, Dict, Any, Optional
-from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from contextlib import asynccontextmanager
+from fastapi import FastAPI, HTTPException, Query
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
 import uvicorn
-from openai import OpenAI
 import chromadb
 from chromadb.config import Settings
+from chromadb.errors import NotFoundError
+from openai import OpenAI
+import logging
 
-# 텔레메트리/프록시 비활성화 (CloudType 환경 대응)
-for k in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy", "OPENAI_PROXY", "NO_PROXY", "no_proxy"):
-    os.environ.pop(k, None)
-os.environ["ANONYMIZED_TELEMETRY"] = "false"
-os.environ["CHROMA_TELEMETRY_IMPLEMENTATION"] = "none"
-# CloudType 환경에서 프록시 관련 추가 제거
-os.environ.pop("REQUESTS_CA_BUNDLE", None)
-os.environ.pop("CURL_CA_BUNDLE", None)
+# Disable telemetry and configure ChromaDB settings
+os.environ["ANONYMIZED_TELEMETRY"] = "False"
+os.environ["CHROMA_SERVER_NOFILE"] = "1"
 
-# 로깅 설정
+# Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# 고정 경로/컬렉션
-CHROMA_DB_PATH = "./chroma_db_uiseong_20250831_new"
-COLLECTION_NAME = "uiseong_policies"
+# Lifespan event handler for startup and shutdown
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
+    logger.info("Starting RAG server...")
+    initialize_openai()
+    initialize_chromadb()
+    logger.info("RAG server startup completed")
+    yield
+    # Shutdown
+    logger.info("RAG server shutting down...")
 
-# FastAPI 앱 초기화
-app = FastAPI(title="RAG API", version="1.0.0")
-
-# CORS 설정
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+# Initialize FastAPI app
+app = FastAPI(
+    title="RAG Server",
+    description="A FastAPI-based RAG server combining ChromaDB vector search with OpenAI",
+    version="1.0.0",
+    lifespan=lifespan
 )
 
-# 전역 변수
-openai_client: Optional[OpenAI] = None
-chroma_client = None
-collection = None
+# Pydantic models for request/response validation
+class SearchResponse(BaseModel):
+    query: str
+    results: List[Dict[str, Any]]
+    total_results: int
 
 class QueryRequest(BaseModel):
-    question: str
-    k: int = 3
-
-class SearchDocument(BaseModel):
-    content: str
-    metadata: Dict[str, Any]
-    distance: float
-
-class SearchResponse(BaseModel):
-    documents: List[SearchDocument]
-    total_count: int
+    question: str = Field(..., description="The question to ask")
+    max_results: int = Field(default=5, description="Maximum number of search results to use for context")
 
 class QueryResponse(BaseModel):
+    question: str
     answer: str
-    source_documents: List[Dict[str, Any]]
 
-@app.on_event("startup")
-async def startup_event():
-    global openai_client, chroma_client, collection
-    
-    # OpenAI 클라이언트 초기화 (CloudType 환경 대응)
+class HealthResponse(BaseModel):
+    status: str
+    version: str
+    services: Dict[str, str]
+
+class ServiceInfo(BaseModel):
+    name: str
+    description: str
+    version: str
+    endpoints: List[str]
+
+# Global variables for services
+chroma_client = None
+collection = None
+openai_client = None
+
+# Initialize OpenAI client
+def initialize_openai():
+    global openai_client
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
-        logger.error("OPENAI_API_KEY environment variable not set")
-        raise RuntimeError("OPENAI_API_KEY environment variable not set")
+        logger.error("OPENAI_API_KEY environment variable not found")
+        raise ValueError("OpenAI API key not configured")
     
-    try:
-        # 프록시 관련 인자를 명시적으로 제거하여 초기화
-        openai_client = OpenAI(
-            api_key=api_key,
-            timeout=30.0,
-            max_retries=3
-        )
-        logger.info("OpenAI client initialized successfully")
-    except Exception as e:
-        logger.error(f"Failed to initialize OpenAI client: {e}")
-        # 더 단순한 방식으로 재시도
-        try:
-            import openai as openai_module
-            openai_client = openai_module.OpenAI(api_key=api_key)
-            logger.info("OpenAI client initialized with fallback method")
-        except Exception as e2:
-            logger.error(f"Fallback OpenAI initialization also failed: {e2}")
-            raise RuntimeError(f"Failed to initialize OpenAI client: {e}")
-    
-    # ChromaDB 클라이언트 초기화
-    try:
-        chroma_client = chromadb.PersistentClient(
-            path=CHROMA_DB_PATH,
-            settings=Settings(anonymized_telemetry=False, allow_reset=False)
-        )
-        collection = chroma_client.get_collection(COLLECTION_NAME)
-        logger.info(f"ChromaDB collection '{COLLECTION_NAME}' loaded from '{CHROMA_DB_PATH}'")
-    except Exception as e:
-        logger.error(f"Failed to initialize ChromaDB: {e}")
-        raise RuntimeError(f"Failed to initialize ChromaDB: {e}")
+    openai_client = OpenAI(api_key=api_key)
+    logger.info("OpenAI client initialized successfully")
 
-def get_embedding(text: str) -> List[float]:
-    """OpenAI 임베딩 생성"""
+# Initialize ChromaDB client and collection
+def initialize_chromadb():
+    global chroma_client, collection
+    
+    try:
+        # ChromaDB settings with telemetry disabled
+        chroma_settings = Settings(
+            anonymized_telemetry=False,
+            allow_reset=True,
+            is_persistent=True,
+            persist_directory="./chroma_db_uiseong_20250831_new"
+        )
+        
+        # Initialize ChromaDB client
+        chroma_client = chromadb.PersistentClient(
+            path="./chroma_db_uiseong_20250831_new",
+            settings=chroma_settings
+        )
+        
+        # Get or create collection
+        try:
+            collection = chroma_client.get_collection(name="uiseong_policies")
+            logger.info(f"ChromaDB collection 'uiseong_policies' loaded successfully")
+        except NotFoundError:
+            logger.info("Collection 'uiseong_policies' not found, creating new collection...")
+            collection = chroma_client.create_collection(name="uiseong_policies")
+            logger.info(f"ChromaDB collection 'uiseong_policies' created successfully")
+        
+    except Exception as e:
+        logger.error(f"Failed to initialize ChromaDB: {str(e)}")
+        raise e
+
+# Generate embeddings using OpenAI
+async def generate_embedding(text: str) -> List[float]:
+    if not openai_client:
+        raise HTTPException(status_code=500, detail="OpenAI client not initialized")
+    
     try:
         response = openai_client.embeddings.create(
             model="text-embedding-3-small",
@@ -110,142 +125,175 @@ def get_embedding(text: str) -> List[float]:
         )
         return response.data[0].embedding
     except Exception as e:
-        logger.error(f"Failed to get embedding: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to get embedding: {e}")
+        logger.error(f"Failed to generate embedding: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Embedding generation failed: {str(e)}")
 
-@app.get("/")
-async def root():
-    return {
-        "service": "RAG API",
-        "version": "1.0.0",
-        "chroma_path": CHROMA_DB_PATH,
-        "collection_name": COLLECTION_NAME
-    }
-
-@app.get("/health")
-@app.get("/healthz")
-async def health_check():
-    try:
-        db_exists = os.path.exists(CHROMA_DB_PATH)
-        document_count = None
-        
-        if collection is not None:
-            try:
-                document_count = collection.count()
-            except Exception as e:
-                logger.warning(f"Could not get document count: {e}")
-        
-        return {
-            "status": "healthy",
-            "db_exists": db_exists,
-            "collection_name": COLLECTION_NAME,
-            "document_count": document_count,
-            "initialized": collection is not None
-        }
-    except Exception as e:
-        logger.error(f"Health check failed: {e}")
-        raise HTTPException(status_code=500, detail=f"Health check failed: {e}")
-
-@app.get("/search/{query}", response_model=SearchResponse)
-async def search_documents(query: str, k: int = 5):
-    if collection is None:
-        raise HTTPException(status_code=500, detail="ChromaDB collection not initialized")
+# Generate answer using OpenAI GPT
+async def generate_answer(question: str, context: str) -> str:
+    if not openai_client:
+        raise HTTPException(status_code=500, detail="OpenAI client not initialized")
     
     try:
-        # 쿼리 임베딩 생성
-        query_embedding = get_embedding(query)
+        system_prompt = """당신은 도움이 되는 AI 어시스턴트입니다. 주어진 문서들의 내용을 바탕으로 질문에 정확하고 상세하게 답변해주세요. 
+        답변은 한국어로 제공하며, 제공된 문서에서 찾을 수 없는 정보는 추측하지 말고 모른다고 말해주세요."""
         
-        # ChromaDB에서 유사 문서 검색
-        results = collection.query(
-            query_embeddings=[query_embedding],
-            n_results=k,
-            include=['metadatas', 'documents', 'distances']
-        )
+        user_prompt = f"""
+        질문: {question}
         
-        documents = []
-        if results['documents'] and results['documents'][0]:
-            for i, doc in enumerate(results['documents'][0]):
-                documents.append(SearchDocument(
-                    content=doc,
-                    metadata=results['metadatas'][0][i] if results['metadatas'] and results['metadatas'][0] else {},
-                    distance=results['distances'][0][i] if results['distances'] and results['distances'][0] else 0.0
-                ))
+        참고 문서:
+        {context}
         
-        return SearchResponse(
-            documents=documents,
-            total_count=len(documents)
-        )
-    
-    except Exception as e:
-        logger.error(f"Search failed: {e}")
-        raise HTTPException(status_code=500, detail=f"Search failed: {e}")
-
-@app.post("/query", response_model=QueryResponse)
-async def query_rag(request: QueryRequest):
-    if collection is None:
-        raise HTTPException(status_code=500, detail="ChromaDB collection not initialized")
-    
-    try:
-        # 1. 쿼리 임베딩 생성
-        query_embedding = get_embedding(request.question)
+        위 문서들을 참고하여 질문에 대한 답변을 제공해주세요.
+        """
         
-        # 2. ChromaDB에서 상위 k개 문서 검색
-        results = collection.query(
-            query_embeddings=[query_embedding],
-            n_results=request.k,
-            include=['metadatas', 'documents', 'distances']
-        )
-        
-        # 3. 컨텍스트 구성
-        context_docs = []
-        if results['documents'] and results['documents'][0]:
-            for i, doc in enumerate(results['documents'][0]):
-                context_docs.append({
-                    "content": doc,
-                    "metadata": results['metadatas'][0][i] if results['metadatas'] and results['metadatas'][0] else {}
-                })
-        
-        if not context_docs:
-            return QueryResponse(
-                answer="죄송합니다. 관련 문서를 찾을 수 없습니다.",
-                source_documents=[]
-            )
-        
-        # 4. 컨텍스트 텍스트 생성
-        context_text = "\n\n".join([doc["content"] for doc in context_docs])
-        
-        # 5. OpenAI Chat Completions로 답변 생성
-        system_message = """당신은 의성군 정책에 대한 질문에 답변하는 AI 어시스턴트입니다. 
-주어진 문서들을 바탕으로 정확하고 도움이 되는 답변을 제공하세요.
-문서에 없는 내용은 추측하지 말고, 모르겠다고 답변하세요."""
-        
-        user_message = f"""다음 문서들을 참고하여 질문에 답변해주세요:
-
-문서들:
-{context_text}
-
-질문: {request.question}"""
-        
-        chat_response = openai_client.chat.completions.create(
+        response = openai_client.chat.completions.create(
             model="gpt-3.5-turbo",
             messages=[
-                {"role": "system", "content": system_message},
-                {"role": "user", "content": user_message}
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
             ],
-            temperature=0.1,
+            temperature=0.7,
             max_tokens=1000
         )
         
-        answer = chat_response.choices[0].message.content
+        answer = response.choices[0].message.content
+        if answer is None:
+            return "죄송합니다. 답변을 생성할 수 없었습니다."
+        return answer
+        
+    except Exception as e:
+        logger.error(f"Failed to generate answer: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Answer generation failed: {str(e)}")
+
+
+# Root endpoint - service information
+@app.get("/", response_model=ServiceInfo)
+async def root():
+    return ServiceInfo(
+        name="RAG Server",
+        description="A FastAPI-based RAG server combining ChromaDB vector search with OpenAI for intelligent document retrieval and question answering",
+        version="1.0.0",
+        endpoints=["/", "/health", "/healthz", "/search/{query}", "/query"]
+    )
+
+# Health check endpoints
+@app.get("/health", response_model=HealthResponse)
+@app.get("/healthz", response_model=HealthResponse)
+async def health_check():
+    services = {}
+    
+    # Check OpenAI connection
+    try:
+        if openai_client:
+            services["openai"] = "healthy"
+        else:
+            services["openai"] = "not_initialized"
+    except Exception:
+        services["openai"] = "unhealthy"
+    
+    # Check ChromaDB connection
+    try:
+        if chroma_client and collection:
+            collection_count = collection.count()
+            services["chromadb"] = f"healthy ({collection_count} documents)"
+        else:
+            services["chromadb"] = "not_initialized"
+    except Exception:
+        services["chromadb"] = "unhealthy"
+    
+    return HealthResponse(
+        status="healthy" if all(status.startswith("healthy") for status in services.values()) else "degraded",
+        version="1.0.0",
+        services=services
+    )
+
+# Search endpoint
+@app.get("/search/{query}", response_model=SearchResponse)
+async def search_documents(
+    query: str,
+    n_results: int = Query(default=10, description="Number of results to return", ge=1, le=100)
+):
+    if not collection:
+        raise HTTPException(status_code=500, detail="ChromaDB collection not initialized")
+    
+    try:
+        # Generate embedding for the query
+        query_embedding = await generate_embedding(query)
+        
+        # Search in ChromaDB
+        results = collection.query(
+            query_embeddings=[query_embedding],
+            n_results=n_results,
+            include=["documents", "metadatas", "distances"]
+        )
+        
+        # Format results
+        formatted_results = []
+        if results['documents'] and len(results['documents']) > 0:
+            for i in range(len(results['documents'][0])):
+                formatted_results.append({
+                    "document": results['documents'][0][i],
+                    "metadata": results['metadatas'][0][i] if results['metadatas'] and results['metadatas'][0] else {},
+                    "distance": results['distances'][0][i] if results['distances'] and results['distances'][0] else None
+                })
+        
+        return SearchResponse(
+            query=query,
+            results=formatted_results,
+            total_results=len(formatted_results)
+        )
+        
+    except Exception as e:
+        logger.error(f"Search failed: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Search operation failed: {str(e)}")
+
+# RAG Query endpoint
+@app.post("/query", response_model=QueryResponse)
+async def rag_query(request: QueryRequest):
+    if not collection:
+        raise HTTPException(status_code=500, detail="ChromaDB collection not initialized")
+    
+    try:
+        # Generate embedding for the question
+        question_embedding = await generate_embedding(request.question)
+        
+        # Search for relevant documents
+        search_results = collection.query(
+            query_embeddings=[question_embedding],
+            n_results=request.max_results,
+            include=["documents", "metadatas", "distances"]
+        )
+        
+        # Prepare context from search results
+        context_parts = []
+        
+        if search_results['documents'] and len(search_results['documents']) > 0:
+            for i in range(len(search_results['documents'][0])):
+                document = search_results['documents'][0][i]
+                context_parts.append(f"문서 {i+1}: {document}")
+        
+        context = "\n\n".join(context_parts)
+        
+        # Generate answer using OpenAI
+        answer = await generate_answer(request.question, context)
         
         return QueryResponse(
-            answer=answer,
-            source_documents=context_docs
+            question=request.question,
+            answer=answer
         )
-    
+        
     except Exception as e:
-        logger.error(f"RAG query failed: {e}")
-        raise HTTPException(status_code=500, detail=f"RAG query failed: {e}")
+        logger.error(f"RAG query failed: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Query processing failed: {str(e)}")
 
+# Run the server
 if __name__ == "__main__":
-    uvicorn.run("backend:app", host="127.0.0.1", port=8000, reload=False)
+    # Configure uvicorn to run on 0.0.0.0:8000 for cloud deployment
+    port = int(os.getenv("PORT", 8000))
+    uvicorn.run(
+        "backend:app",
+        host="0.0.0.0",
+        port=port,
+        reload=False,
+        log_level="info"
+    )
