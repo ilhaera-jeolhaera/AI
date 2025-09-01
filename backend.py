@@ -8,6 +8,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 import uvicorn
 import chromadb
+from fastapi.middleware.cors import CORSMiddleware
 from chromadb.config import Settings
 from chromadb.errors import NotFoundError
 from openai import OpenAI
@@ -40,6 +41,21 @@ app = FastAPI(
     version="1.0.0",
     lifespan=lifespan
 )
+# 배포/개발 도메인을 환경변수로 관리 (쉼표로 구분)
+# 예: CORS_ALLOW_ORIGINS="http://localhost:5173,http://localhost:5174,https://your-frontend.com"
+origins = os.getenv(
+    "CORS_ALLOW_ORIGINS",
+    "http://localhost:5173,http://localhost:5174"
+).split(",")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[o.strip() for o in origins if o.strip()],
+    allow_credentials=True,                     # 쿠키/인증 사용 시 true (axios withCredentials 필요)
+    allow_methods=["GET", "POST", "OPTIONS"],   # 필요 시 ["*"]
+    allow_headers=["*"],
+)
+
 
 # Pydantic models for request/response validation
 class SearchResponse(BaseModel):
