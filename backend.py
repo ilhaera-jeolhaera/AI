@@ -45,7 +45,7 @@ app = FastAPI(
 # 예: CORS_ALLOW_ORIGINS="http://localhost:5173,http://localhost:5174,https://your-frontend.com"
 origins = os.getenv(
     "CORS_ALLOW_ORIGINS",
-    "http://localhost:5173,http://localhost:5174"
+    "http://localhost:5173,http://localhost:5174, https://uiseong-hwnsngs-projects.vercel.app/ ,https://uiseong.vercel.app/"
 ).split(",")
 
 app.add_middleware(
