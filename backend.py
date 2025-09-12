@@ -48,8 +48,12 @@ def normalize_linebreaks(text: str, wrap_width: int = 90) -> str:
     # 라벨 뒤에는 줄바꿈 보장
     s = re.sub(r'(정책명|대상|지원내용|신청방법|필요서류|참고사항)\s*:\s*', r'\n\1: ', s)
 
-    # 종결 어미 뒤에는 줄바꿈 힌트 (과도 분절 방지)
+    # 종결 어미 뒤에는 줄바꿈 힌트
     s = re.sub(r'(다\.|요\.|함\.|임\.)\s+', r'\1\n', s)
+
+    # 불필요한 불릿 제거
+    s = re.sub(r'^\s*[-•]\s*', '', s, flags=re.MULTILINE)
+    s = re.sub(r'^\s*\d+\.\s*', '', s, flags=re.MULTILINE)
 
     # 연속 개행 정리
     s = re.sub(r'\n{3,}', '\n\n', s).strip()
@@ -57,11 +61,9 @@ def normalize_linebreaks(text: str, wrap_width: int = 90) -> str:
     # 단락 래핑
     wrapped_lines = []
     for para in s.split('\n'):
-        if para.startswith('- '):  # 불릿은 부드럽게 래핑
-            wrapped_lines.append(textwrap.fill(para, width=wrap_width, subsequent_indent='  '))
-        else:
-            wrapped_lines.append(textwrap.fill(para, width=wrap_width))
+        wrapped_lines.append(textwrap.fill(para, width=wrap_width))
     return '\n'.join(wrapped_lines)
+
 
 def format_answer_for_readability(raw: str) -> str:
     """마크다운 제거 → 줄바꿈 정리 → 래핑"""
