@@ -16,7 +16,9 @@ FastAPI 기반 RAG(Retrieval-Augmented Generation) 서버입니다. ChromaDB 벡
 - **Vector DB**: ChromaDB (`text-embedding-3-small` 임베딩)
 - **LLM**: OpenAI GPT-3.5-turbo
 - **Data**: Pandas (CSV 로더)
-- **Deploy**: Docker
+- **Deploy**: Docker, [Cloudtype](https://cloudtype.io/) (배포 완료)
+
+> 본 서버는 **Cloudtype**을 통해 클라우드에 배포되어 운영 중입니다. `dockerfile` 기반으로 이미지가 빌드되며, Cloudtype 환경에서 `OPENAI_API_KEY` 등 환경 변수를 설정해 실행됩니다.
 
 ## 프로젝트 구조
 
